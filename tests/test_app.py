@@ -1,4 +1,4 @@
-"""端到端流程 + 整趟替换 + 并发确认测试。"""
+"""端到端流程 + 版本发布/历史保留 + 并发确认测试。"""
 import io
 import threading
 import time
@@ -91,7 +91,7 @@ def test_bad_csv_flashes_error_and_no_trip(client):
     assert storage.list_trips() == []
 
 
-def test_revision_replaces_whole_trip_and_drops_deleted_box(client):
+def test_revision_publishes_new_evidence_but_keeps_history(client):
     page = _upload(client)
     trip_id = page.request.path.split("/")[-2]
     client.post(f"/trips/{trip_id}/confirm")
@@ -116,20 +116,37 @@ def test_revision_replaces_whole_trip_and_drops_deleted_box(client):
     trip = storage.get_trip(trip_id)
     assert trip["revision"] == 2
     boxes = {r["box"] for r in trip["results"]}
-    assert boxes == {"BOX-1"}  # 删除的箱号没有留下旧结论
+    assert boxes == {"BOX-1"}  # 新版不再包含删除的箱号
+
+    # 新版（rev 2）明细中没有 BOX-2
     with storage.db_cursor() as conn:
-        leftover = conn.execute(
-            "SELECT COUNT(*) AS n FROM trip_result WHERE trip_id=? AND box='BOX-2'",
+        current = conn.execute(
+            "SELECT COUNT(*) AS n FROM trip_result WHERE trip_id=? AND revision=2 AND box='BOX-2'",
             (trip_id,),
         ).fetchone()["n"]
-        leftover_rides = conn.execute(
-            "SELECT COUNT(*) AS n FROM trip_ride WHERE trip_id=? AND box='BOX-2'",
+        # 但 rev 1 的历史证据完整保留，没有被删除或重算
+        old_ride = conn.execute(
+            "SELECT COUNT(*) AS n FROM trip_ride WHERE trip_id=? AND revision=1 AND box='BOX-2'",
             (trip_id,),
         ).fetchone()["n"]
-    assert leftover == 0 and leftover_rides == 0
-    # 上限 4.5 后 BOX-1 出现更多超温段
+        old_result = conn.execute(
+            "SELECT COUNT(*) AS n FROM trip_result WHERE trip_id=? AND revision=1 AND box='BOX-2'",
+            (trip_id,),
+        ).fetchone()["n"]
+    assert current == 0
+    assert old_ride == 1 and old_result == 1
+
+    # 上限 4.5 后 BOX-1 出现更多超温段（rev 2 新证据）
     r = trip["results"][0]
     assert r["hot_seconds"] > 300
+
+    # 历史接口可回查 rev 1 当时的完整证据
+    rev1 = storage.get_trip_revision(trip_id, 1)
+    assert rev1["traceable"] is True and rev1["revision"] == 1
+    rev1_boxes = {ride["box"] for ride in rev1["rides"]}
+    assert rev1_boxes == {"BOX-1", "BOX-2"}
+    rev1_limits = {x["box"]: x for x in rev1["results"]}
+    assert rev1_limits["BOX-1"]["hot_seconds"] == 300  # 旧上限 8.0 下的原始结论
 
 
 def test_concurrent_confirmation_only_one_succeeds(app, client):
@@ -205,7 +222,7 @@ def test_query_always_sees_complete_version(app, client):
     th.start()
     time.sleep(0.05)
 
-    # 连续做 5 次整趟替换，每次箱号集合都不同
+    # 连续发布 5 个新版本，每版箱号集合都不同（旧版明细按修订号保留）
     for i in range(5):
         handling = (
             "box,loaded_at,unloaded_at\n"

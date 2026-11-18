@@ -4,8 +4,12 @@
 - 每个 trip 有单调递增 revision；确认提交采用条件更新
   UPDATE trip SET revision=? WHERE id=? AND revision=?，配合 BEGIN IMMEDIATE
   写事务，同一 revision 的并发确认只有一个事务能成功（其余提交 0 行 -> 409）。
-- 每次确认在单个事务内整趟替换：删除旧 readings/rides/results 后重插，
-  任何一步失败全部回滚；查询永远只能看到完整旧版或完整新版。
+- 每次确认在单个事务内：写入 trip_revision 历史快照 + 追加该版
+  readings/rides/results 明细，任何一步失败全部回滚；查询永远只能看到
+  完整旧版或完整新版，历史证据只增不改、不做整趟删除。
+- 历史版本功能首次启用时，对旧库做一次性回填：旧库每趟只留存当前正式版
+  的明细，故仅当前 revision 可追溯，更早修订号登记为"不可追溯"占位，
+  绝不以新版数据重算充数。
 - WAL 模式 + busy_timeout，兼顾读写并发与重启后的持久化。
 """
 from __future__ import annotations
@@ -51,6 +55,21 @@ CREATE TABLE IF NOT EXISTS trip_result (
 );
 CREATE INDEX IF NOT EXISTS idx_ride_trip ON trip_ride(trip_id, revision);
 CREATE INDEX IF NOT EXISTS idx_result_trip ON trip_result(trip_id, revision);
+CREATE INDEX IF NOT EXISTS idx_reading_trip ON trip_reading(trip_id, revision);
+-- 历史版本：每次确认追加一行，只增不改。traceable=0 表示该修订号的证据
+-- 在历史功能启用前未留存，readings/rides/results 为 NULL，禁止重算补造。
+CREATE TABLE IF NOT EXISTS trip_revision (
+    trip_id      TEXT NOT NULL,
+    revision     INTEGER NOT NULL,
+    name         TEXT NOT NULL,
+    temp_limit   REAL NOT NULL,
+    confirmed_at TEXT NOT NULL,
+    traceable    INTEGER NOT NULL,
+    readings     TEXT,
+    rides        TEXT,
+    results      TEXT,
+    PRIMARY KEY (trip_id, revision)
+);
 CREATE TABLE IF NOT EXISTS trip_draft (
     trip_id TEXT PRIMARY KEY, expected_revision INTEGER NOT NULL,
     name TEXT NOT NULL, temp_limit REAL NOT NULL,
@@ -61,6 +80,11 @@ CREATE TABLE IF NOT EXISTS trip_draft_source (
     trip_id TEXT PRIMARY KEY, temp_csv TEXT NOT NULL, handling_csv TEXT NOT NULL
 );
 """
+
+UNTRACEABLE_NOTE = (
+    "该修订号的证据在历史版本功能启用前未留存，不可追溯；"
+    "未以任何新版数据重算或补造。"
+)
 
 
 class RevisionConflict(RuntimeError):
@@ -93,8 +117,84 @@ def init_db(db_path: str | Path) -> None:
     conn = _connect(db_path)
     try:
         conn.executescript(SCHEMA)
+        # 一次性回填旧库现存正式版（幂等：已登记的修订号跳过）
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            _backfill_legacy_revisions(conn)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
     finally:
         conn.close()
+
+
+def _backfill_legacy_revisions(conn: sqlite3.Connection) -> None:
+    """历史版本功能首次启用时回填旧库。
+
+    旧库采用整趟替换，每个 trip 只留存当前 revision 的明细，因此：
+    - 更早的修订号 1..revision-1 只能登记为不可追溯占位（traceable=0），
+      证据列留 NULL，绝不拿新版读数重算；
+    - 当前 revision 用库中实际留存的 readings/rides/results 回填为可追溯。
+    """
+    trips = conn.execute(
+        "SELECT id, name, temp_limit, revision, confirmed_at FROM trip"
+    ).fetchall()
+    for t in trips:
+        trip_id, revision = t["id"], t["revision"]
+        already = conn.execute(
+            "SELECT COUNT(*) AS n FROM trip_revision WHERE trip_id=?", (trip_id,)
+        ).fetchone()["n"]
+        if already:
+            continue
+
+        # 更早修订号：无证据可回填，标明不可追溯
+        for rev in range(1, revision):
+            conn.execute(
+                "INSERT OR IGNORE INTO trip_revision(trip_id, revision, name, "
+                "temp_limit, confirmed_at, traceable, readings, rides, results) "
+                "VALUES(?,?,?,?,?,0,NULL,NULL,NULL)",
+                (trip_id, rev, t["name"], t["temp_limit"], t["confirmed_at"]),
+            )
+
+        # 当前正式版：以库中真实留存的证据回填，不做任何重新计算
+        readings = conn.execute(
+            "SELECT ts, celsius FROM trip_reading WHERE trip_id=? AND revision=? "
+            "ORDER BY ts",
+            (trip_id, revision),
+        ).fetchall()
+        rides = conn.execute(
+            "SELECT box, loaded_at, unloaded_at FROM trip_ride "
+            "WHERE trip_id=? AND revision=? ORDER BY box",
+            (trip_id, revision),
+        ).fetchall()
+        result_rows = conn.execute(
+            "SELECT * FROM trip_result WHERE trip_id=? AND revision=? ORDER BY box",
+            (trip_id, revision),
+        ).fetchall()
+        results_dict = {
+            r["box"]: {
+                "hot_seconds": r["hot_seconds"],
+                "unknown_seconds": r["unknown_seconds"],
+                "total_seconds": r["total_seconds"],
+                "hot_segments": json.loads(r["hot_segments"]),
+                "unknown_segments": json.loads(r["unknown_segments"]),
+            }
+            for r in result_rows
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO trip_revision(trip_id, revision, name, temp_limit, "
+            "confirmed_at, traceable, readings, rides, results) "
+            "VALUES(?,?,?,?,?,1,?,?,?)",
+            (
+                trip_id, revision, t["name"], t["temp_limit"], t["confirmed_at"],
+                json.dumps([[r["ts"], r["celsius"]] for r in readings],
+                           separators=(",", ":")),
+                json.dumps([[r["box"], r["loaded_at"], r["unloaded_at"]] for r in rides],
+                           separators=(",", ":")),
+                json.dumps(results_dict, separators=(",", ":")),
+            ),
+        )
 
 
 @contextmanager
@@ -131,6 +231,7 @@ def upsert_draft(
     """保存草稿（同一 trip 反复修正只保留最新一份）。
 
     草稿带 expected_revision：确认时若 trip.revision 已前进则拒绝。
+    草稿不属于正式版本，不会写入 trip_revision 历史。
     """
     with db_cursor(commit=True) as conn:
         conn.execute(
@@ -171,7 +272,7 @@ def delete_draft(conn: sqlite3.Connection, trip_id: str) -> None:
     conn.execute("DELETE FROM trip_draft WHERE trip_id=?", (trip_id,))
 
 
-# ---------- 正式版本（已确认结论，只增不改） ----------
+# ---------- 正式版本（已确认结论，历史只增不改） ----------
 
 def commit_revision(
     trip_id: str,
@@ -182,9 +283,12 @@ def commit_revision(
     rides: list[tuple[str, int, int]],
     results: dict[str, dict],
 ) -> int:
-    """整趟替换提交。返回新 revision；expected_revision 过期则抛 RevisionConflict。
+    """原子提交一个新正式版本。返回新 revision；expected_revision 过期则抛冲突。
 
     新 trip（expected_revision=0 且不存在）创建为 revision 1。
+    所有写入（trip 指针、trip_revision 历史快照、该版明细、草稿清理）在
+    同一个 BEGIN IMMEDIATE 事务内完成：要么全部成功，要么全部回滚并保持
+    旧版完整状态，不存在"发布成功但证据缺失"的中间态。
     """
     with db_cursor(commit=True) as conn:
         trip = conn.execute("SELECT revision FROM trip WHERE id=?", (trip_id,)).fetchone()
@@ -194,26 +298,39 @@ def commit_revision(
                 f"修订号已过期：页面基于 rev {expected_revision}，当前为 rev {current}"
             )
         new_revision = current + 1
+        confirmed_at = conn.execute(
+            "SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now') AS now"
+        ).fetchone()["now"]
 
         if trip is None:
             conn.execute(
                 "INSERT INTO trip(id, name, revision, temp_limit, confirmed_at) "
-                "VALUES(?,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-                (trip_id, name, new_revision, temp_limit),
+                "VALUES(?,?,?,?,?)",
+                (trip_id, name, new_revision, temp_limit, confirmed_at),
             )
         else:
             updated = conn.execute(
-                "UPDATE trip SET revision=?, name=?, temp_limit=?, "
-                "confirmed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                "UPDATE trip SET revision=?, name=?, temp_limit=?, confirmed_at=? "
                 "WHERE id=? AND revision=?",
-                (new_revision, name, temp_limit, trip_id, current),
+                (new_revision, name, temp_limit, confirmed_at, trip_id, current),
             ).rowcount
             if updated != 1:  # 并发下另一事务已推进 revision
                 raise RevisionConflict("同一修订号的并发确认只允许一次")
-            # 整趟替换：先删旧数据（含已删除箱号的旧结论），再插新版
-            for table in ("trip_reading", "trip_ride", "trip_result"):
-                conn.execute(f"DELETE FROM {table} WHERE trip_id=?", (trip_id,))
 
+        # 历史快照：整版证据一并落库，旧版行保留不动
+        conn.execute(
+            "INSERT INTO trip_revision(trip_id, revision, name, temp_limit, "
+            "confirmed_at, traceable, readings, rides, results) "
+            "VALUES(?,?,?,?,?,1,?,?,?)",
+            (
+                trip_id, new_revision, name, temp_limit, confirmed_at,
+                json.dumps(readings, separators=(",", ":")),
+                json.dumps(rides, separators=(",", ":")),
+                json.dumps(results, separators=(",", ":")),
+            ),
+        )
+
+        # 该版明细按修订号追加，不再删除任何旧版数据
         conn.executemany(
             "INSERT INTO trip_reading(trip_id, revision, ts, celsius) VALUES(?,?,?,?)",
             [(trip_id, new_revision, ts, c) for ts, c in readings],
@@ -237,11 +354,14 @@ def commit_revision(
                 for box, r in results.items()
             ],
         )
+        # 草稿及其 CSV 原文与正式发布在同一事务内清理
         delete_draft(conn, trip_id)
+        conn.execute("DELETE FROM trip_draft_source WHERE trip_id=?", (trip_id,))
         return new_revision
 
 
 def get_trip(trip_id: str) -> dict:
+    """读取最新正式版（单一只读事务、同一快照，保证只见一版完整证据）。"""
     with db_cursor() as conn:
         trip = conn.execute("SELECT * FROM trip WHERE id=?", (trip_id,)).fetchone()
         if trip is None:
@@ -290,3 +410,70 @@ def list_trips() -> list[dict]:
             "FROM trip t ORDER BY t.created_at DESC"
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------- 历史版本 ----------
+
+def list_revisions(trip_id: str) -> list[dict]:
+    """列出某趟次全部已确认修订号（不含未确认草稿）。趟次不存在抛 NotFound。"""
+    with db_cursor() as conn:
+        trip = conn.execute("SELECT id FROM trip WHERE id=?", (trip_id,)).fetchone()
+        if trip is None:
+            raise NotFound(f"运输趟次不存在：{trip_id}")
+        rows = conn.execute(
+            "SELECT trip_id, revision, name, temp_limit, confirmed_at, traceable "
+            "FROM trip_revision WHERE trip_id=? ORDER BY revision",
+            (trip_id,),
+        ).fetchall()
+    return [
+        {
+            "trip_id": r["trip_id"],
+            "revision": r["revision"],
+            "name": r["name"],
+            "temp_limit": r["temp_limit"],
+            "confirmed_at": r["confirmed_at"],
+            "traceable": bool(r["traceable"]),
+        }
+        for r in rows
+    ]
+
+
+def get_trip_revision(trip_id: str, revision: int) -> dict:
+    """读取指定修订号的完整证据快照。
+
+    可追溯版本返回该版当时的读数、装卸时段、温度上限、确认时间与逐箱结论；
+    不可追溯版本只返回元信息与 traceable=False，证据字段为 None。
+    不存在的 (trip_id, revision) 抛 NotFound。
+    """
+    with db_cursor() as conn:
+        row = conn.execute(
+            "SELECT * FROM trip_revision WHERE trip_id=? AND revision=?",
+            (trip_id, revision),
+        ).fetchone()
+        if row is None:
+            raise NotFound(f"运输趟次 {trip_id} 不存在修订号 rev {revision}")
+        out = {
+            "id": row["trip_id"],
+            "revision": row["revision"],
+            "name": row["name"],
+            "temp_limit": row["temp_limit"],
+            "confirmed_at": row["confirmed_at"],
+            "traceable": bool(row["traceable"]),
+        }
+        if not row["traceable"]:
+            out.update(readings=None, rides=None, results=None,
+                       note=UNTRACEABLE_NOTE)
+            return out
+
+        readings = json.loads(row["readings"])
+        rides_raw = json.loads(row["rides"])
+        results_raw = json.loads(row["results"])
+        out["readings"] = [(ts, c) for ts, c in readings]
+        out["rides"] = [
+            {"box": box, "loaded_at": lo, "unloaded_at": ul}
+            for box, lo, ul in rides_raw
+        ]
+        out["results"] = [
+            {"box": box, **results_raw[box]} for box in sorted(results_raw)
+        ]
+        return out

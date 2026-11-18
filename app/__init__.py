@@ -197,6 +197,8 @@ def create_app(db_path: str | Path | None = None) -> Flask:
         if draft is None:
             abort(404)
         try:
+            # 发布与该版证据（历史快照 + 明细 + 草稿清理）在同一事务内完成：
+            # 一并成功，或整体回滚保持旧正式版不变
             new_rev = storage.commit_revision(
                 trip_id, draft["expected_revision"], draft["name"], draft["temp_limit"],
                 draft["readings"], [tuple(r) for r in draft["rides"]], draft["results"],
@@ -204,9 +206,11 @@ def create_app(db_path: str | Path | None = None) -> Flask:
         except storage.RevisionConflict as exc:
             flash(f"确认失败：{exc}。请基于最新版本重新修正。", "error")
             return redirect(url_for("preview", trip_id=trip_id))
-        with storage.db_cursor(commit=True) as conn:
-            conn.execute("DELETE FROM trip_draft_source WHERE trip_id=?", (trip_id,))
-        flash(f"已确认，正式版本号 rev {new_rev}（整趟替换，旧结论已清除）", "success")
+        flash(
+            f"已确认，正式版本号 rev {new_rev}；该版证据已存档，"
+            "旧版读数与结论均保留，可在历史版本中回查",
+            "success",
+        )
         return redirect(url_for("trip_detail", trip_id=trip_id))
 
     @app.route("/trips/<trip_id>")
@@ -226,8 +230,48 @@ def create_app(db_path: str | Path | None = None) -> Flask:
             mimetype="application/json",
         )
 
+    # ---------- 历史版本（只增不改的已确认证据） ----------
+
+    @app.route("/trips/<trip_id>/revisions")
+    def revisions(trip_id: str):
+        """历史版本列表；?rev=N 时只呈现该修订号的一版完整证据。"""
+        try:
+            revisions_list = storage.list_revisions(trip_id)
+        except storage.NotFound:
+            abort(404)
+        current = storage.get_trip(trip_id)
+        selected = None
+        rev_param = request.args.get("rev", type=int)
+        if rev_param is not None:
+            try:
+                selected = storage.get_trip_revision(trip_id, rev_param)
+            except storage.NotFound:
+                abort(404)
+        return render_template(
+            "revisions.html",
+            trip_id=trip_id, current_revision=current["revision"],
+            revisions=revisions_list, selected=selected,
+            fmt=fmt_ts, fmt_duration=fmt_duration,
+        )
+
+    @app.route("/trips/<trip_id>/revisions/<int:revision>/api")
+    def api_revision(trip_id: str, revision: int):
+        """指定修订号证据 JSON：只输出该一版，不与其他版本混合。"""
+        try:
+            data = storage.get_trip_revision(trip_id, revision)
+        except storage.NotFound:
+            abort(404)
+        return app.response_class(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            mimetype="application/json",
+        )
+
     @app.errorhandler(404)
     def not_found(_):
+        return render_template("404.html"), 404
+
+    @app.errorhandler(storage.NotFound)
+    def storage_not_found(_):
         return render_template("404.html"), 404
 
     @app.template_filter("fmt")

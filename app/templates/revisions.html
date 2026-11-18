@@ -1,0 +1,120 @@
+{% extends "base.html" %}
+{% block title %}历史版本 · {{ trip_id }}{% endblock %}
+{% block body %}
+<div class="card">
+  <h1>历史版本 <span class="muted">趟次 <code>{{ trip_id }}</code></span>
+    <span class="badge badge-rev">当前正式版 rev {{ current_revision }}</span></h1>
+  <p class="muted">
+    每次确认都会把该版的完整证据（温度读数、装卸时段、温度上限、确认时间、逐箱结论）
+    作为只读快照存档，只增不改；未确认的草稿不会出现在这里。
+  </p>
+  <table>
+    <thead>
+      <tr><th>修订号</th><th>确认时间 (UTC)</th><th>温度上限</th><th>证据状态</th><th></th></tr>
+    </thead>
+    <tbody>
+    {% for r in revisions %}
+      <tr>
+        <td><strong>rev {{ r.revision }}</strong>
+          {% if r.revision == current_revision %}<span class="badge badge-ok">最新正式版</span>{% endif %}
+        </td>
+        <td class="seg">{{ r.confirmed_at or "—" }}</td>
+        <td>{{ r.temp_limit }} ℃</td>
+        <td>
+          {% if r.traceable %}<span class="badge badge-ok">可追溯</span>
+          {% else %}<span class="badge badge-unk">不可追溯</span>{% endif %}
+        </td>
+        <td>
+          <a class="btn" href="{{ url_for('revisions', trip_id=trip_id, rev=r.revision) }}">查看该版</a>
+          {% if r.traceable %}
+            <a class="btn secondary" href="{{ url_for('api_revision', trip_id=trip_id, revision=r.revision) }}">该版 JSON</a>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+{% if selected %}
+<div class="card">
+  <h1>rev {{ selected.revision }} 证据
+    {% if selected.revision == current_revision %}<span class="badge badge-ok">最新正式版</span>{% endif %}
+    {% if selected.traceable %}<span class="badge badge-ok">可追溯</span>
+    {% else %}<span class="badge badge-unk">不可追溯</span>{% endif %}
+  </h1>
+
+  {% if not selected.traceable %}
+  <div class="warn-box">
+    ⚠ rev {{ selected.revision }} 的证据在历史版本功能首次启用前未留存，
+    <strong>不可追溯</strong>。系统不会用新版数据重算或补造该版内容，
+    因此不提供该版 JSON 证据。
+    <p class="muted" style="margin:8px 0 0">{{ selected.note }}</p>
+  </div>
+  {% else %}
+  <p class="muted">
+    名称 <strong>{{ selected.name }}</strong> ｜ 确认时间
+    <strong class="seg">{{ selected.confirmed_at }}（UTC）</strong> ｜
+    温度上限 <strong>{{ selected.temp_limit }} ℃</strong> ｜
+    读数 {{ selected.readings|length }} 条 ｜ 箱号 {{ selected.rides|length }} 个 ｜
+    <a href="{{ url_for('api_revision', trip_id=trip_id, revision=selected.revision) }}">获取该版 JSON</a>
+  </p>
+
+  <h2>该版温度读数（确认时存档，UTC）</h2>
+  <table>
+    <thead><tr><th>时刻 (UTC)</th><th>温度 (℃)</th><th>相对上限 {{ selected.temp_limit }}℃</th></tr></thead>
+    <tbody>
+    {% for ts, c in selected.readings %}
+      <tr>
+        <td class="seg">{{ ts|fmt }}</td>
+        <td>{{ c }}</td>
+        <td>{% if c > selected.temp_limit %}<span class="hot">超过上限</span>
+          {% else %}<span class="ok">未超上限</span>{% endif %}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <h2>逐箱装卸时段与超温 / 未知时段</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>箱号</th><th>在车时段 (UTC)</th>
+        <th>超温时长</th><th>未知时长</th><th>超温时间段</th><th>未知时间段</th><th>判定</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for r in selected.results %}
+      {% set ride = selected.rides[loop.index0] %}
+      <tr>
+        <td><strong>{{ r.box }}</strong></td>
+        <td class="seg">{{ ride.loaded_at|fmt }}<br>→ {{ ride.unloaded_at|fmt }}</td>
+        <td class="hot">{{ r.hot_seconds|duration }}</td>
+        <td class="unk">{{ r.unknown_seconds|duration }}</td>
+        <td class="seg">
+          {% for s in r.hot_segments %}
+            {{ s.start|fmt }} → {{ s.end|fmt }}（{{ s.temperature }}℃，{{ (s.end-s.start)|duration }}）<br>
+          {% else %}<span class="muted">无</span>{% endfor %}
+        </td>
+        <td class="seg">
+          {% for s in r.unknown_segments %}
+            {{ s.start|fmt }} → {{ s.end|fmt }}（{{ (s.end-s.start)|duration }}）<br>
+          {% else %}<span class="muted">无</span>{% endfor %}
+        </td>
+        <td>
+          {% if r.unknown_seconds > 0 %}<span class="badge badge-unk">存在未知</span>
+          {% elif r.hot_seconds > 0 %}<span class="badge badge-hot">超温</span>
+          {% else %}<span class="badge badge-ok">合格</span>{% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <p class="muted" style="margin-top:10px">
+    本页与 JSON 均为 rev {{ selected.revision }} 当版存档证据，不与任何其他修订号的数据混合；
+    时长格式 时:分:秒，未知时段不按合格处理。
+  </p>
+  {% endif %}
+</div>
+{% endif %}
+{% endblock %}
